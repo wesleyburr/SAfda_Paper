@@ -1,0 +1,95 @@
+---
+title: "Read In Data, Impute, Save Out"
+author: "Wesley Burr"
+date: "2022-11-21"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Data, Setup Packages
+
+```{r libraries, echo = FALSE, warning = FALSE, message = FALSE, error = FALSE}
+library(readr)
+library(lubridate)
+library(tidyverse)
+library(tsinterp)
+```
+
+```{r load_clean}
+dat <- readRDS("source_data.rds")
+
+plot(dat$date, dat$`16.55`, type = "l",
+     xlab = "Date/Time", ylab = "Particle Counts")
+abline(v = dat$date[which(is.na(dat$`16.55`))], 
+       col = "red", lty = 3)
+```
+
+### Initial Fill: Just Throw it at the Function
+
+To start, we will just throw the missingness at the univariate
+interpolator function in `tsinterp`, and let it churn. This has some
+built-in logic: 
+
+* Find all gap 'blocks'
+* Linearly interpolate the gaps
+* Iterate over:
+    - Estimate mean trend function
+    - Estimate periodic function
+    - Estimate approximately stationary Wiener interpolator
+      until convergence; at each stage, forward-substitute previous
+      interpolation pieces, leaving only current stage unknown.
+
+The package can be found on [https://www.github.com/wesleyburr/tsinterp](GitHub).
+
+```{r} 
+z <- dat$`16.55`
+gap <- which(is.na(z))
+res <- interpolate(z, gap, maxit = 20, sigClip = 0.99, delT = 60 * 60)
+check <- res[[0]]
+check[check < 0] <- 0.0
+plot(check, type = "l")
+```
+
+This ran pretty well - there are some negatives, and the big gap at the
+end wasn't very well interpolated, but it was highly erratic and variable
+data, so a lot of it wasn't predictable. We could do some permutations on
+the residuals and do some modeling of the permutations if there's compute 
+power available.
+
+Now, to run this for the rest of the time series in the set!
+
+## Impute the World
+
+```{r}
+library("parallel")
+```
+
+NOTE: do not run this. It takes a very long time. The entire process on
+16 cores took over 72 hours to run. Also, note that the first column
+of the `dat` object is the `Date`.
+
+```{r, eval = FALSE}
+int <- mclapply(dat[, -1], FUN = function(x) { 
+  z <- unlist(x) 
+  gap <- which(is.na(z)) 
+  res <- interpolate(z, gap, maxit = 20, sigClip = 0.99, delT = 60 * 60) 
+  y <- res[[1]] 
+  y[y < 0] <- 0.0 
+  y 
+}, mc.cores = 16)
+```
+
+We have provided the interpolated data as well.
+
+```{r, eval = FALSE}
+int <- data.frame(date = dat[, 1], int)
+names(int) <- names(dat)
+saveRDS(int, file = "source_data_int.rds")
+```
+
+
