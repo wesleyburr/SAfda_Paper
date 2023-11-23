@@ -1,0 +1,284 @@
+---
+title: "Process and Compute"
+author: "Wesley Burr"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Set Up
+
+We use the `fda` library and also our own custom library with functions for
+Source Apportionment through Functional Data Analysis (`SAfda`), available
+on GitHub.
+
+```{r, message = FALSE, warning = FALSE, error = FALSE}
+library(fda)
+library(SAfda)
+library(robCompositions)
+```
+
+In the first step, we imputed the available data set to provide 51 contiguous
+records of air pollution. Now, load that data in, and then extract the dates and
+the `Dens` matrix of particulate-size observations.
+
+```{r}
+int <- readRDS('source_data_int.rds')
+dates <- int$date
+Dens <- int[-1]
+```
+
+The columns of the `Dens` matrix are sizes, and the rows are the Particle
+Number Size Distribution (PNSD) at that time point. There is a glitch
+which requires that we floor the particle observations: anything below
+0.80 is below the detection limit, so gets set to 0.8.
+
+```{r}
+Dens <- lapply(Dens, FUN = function(x) { 
+                 y <- as.numeric(x) 
+                 y[y <= 0.79] <- 0.8
+                 y
+               })
+```
+
+Now, reformat `Dens` into a matrix, and extract the names, which are the sampling
+bins (particle sizes).
+
+```{r}
+Dens <- matrix(unlist(Dens), byrow = FALSE, ncol = 51)
+x <- as.numeric( names(int)[-1] )   # sampling bins 
+```
+
+## Specific Parameters for the Source Apportionment
+
+We will now define a grid for `x` in logarithmic scale. From above,
+`x` is the particle size distribution, so 51 different particle sizes
+for this particular example. We choose the step-size to be 1000
+to make the smoothing splines compatible below.
+
+```{r}
+lowbound.x <- floor(x)[1]
+log.x <- c(log(lowbound.x), log(x))
+x.fine <- seq(min(log.x), 
+              max(log.x), 
+              length.out = 1000) 
+x.step <- diff(x.fine[1:2])
+width <- as.matrix(diff(log.x)) 
+```
+
+The final variable, `width`, is used in the histogram and Riemann sum 
+calculations that follow. And finally, the `centers` of the size bins
+are also useful:
+
+```{r}
+centers <- matrix(data = log.x[-length(log.x)] + (log.x[-1] - log.x[-length(log.x)]) / 2,
+                  nrow = length(log.x) - 1,
+                  ncol = 1)
+```
+
+We now normalize the PNSD, producing a new object, `densities`:
+
+```{r}
+norm.hist <- t(apply(Dens, MAR = 1, FUN = function(x) { unlist(x / sum(x)) }))
+width_prod <- matrix(data = 1 / width, 
+                     nrow = nrow(Dens), 
+                     ncol = ncol(Dens), 
+                     byrow = TRUE)
+densities <- norm.hist * width_prod
+```
+
+We now map the compositional data into a D-dimensional real space using
+the *Centred logratio coefficients* transformation from the `robCompositions`
+package:
+
+```{r}
+Dens.clr <- robCompositions::cenLR((densities))$x.clr
+```
+
+### Setting up the B-Splines
+
+Now, we set the parameters of the B-splines we will use in the FDA. The parameters
+are:
+* `knots`:  knots of the spline
+* `t`: point of approximation,
+* `f`: values at t,
+* `w`: coefficients for weights,
+* `k`: order of spline, degree = `k-1`
+* `der`: derivation.
+* `alpha`: smoothing parameter
+* `ch`: functional form. 1 gives `1-alpha` and `alpha`; 2 gives a functional with `alpha`
+
+```{r}
+n.basis <- 20
+knots <- seq(min(x.fine),
+             max(x.fine),
+             length.out = n.basis) 
+w <- rep(1, ncol(Dens.clr)) 
+k <- 4
+der <- 2
+alpha <- 0.999
+ch <- 1     
+tp <- c(t(centers))
+```
+
+Now, generate the $z$-coefficients for the B-spline basis:
+
+```{r}
+J <- numeric(nrow(Dens.clr))
+z_coef <- matrix(data = 0,
+                 nrow = length(knots) + 1,
+                 ncol = nrow(Dens.clr))
+```
+
+We now need to work across the records. The PNSDs are done by hour,
+and we have a LOT of them (68,664 in total). This is where the sweet
+spot for numerical/computational optimization can come in.
+
+```{r}
+library(parallel)
+#  setup cluster
+cl <- makeCluster(getOption("cl.cores", 16))
+clusterExport(cl, c("n.basis", "x.fine", "knots", "k", "der", 
+                    "Dens.clr", "w", "alpha", "ch", "centers", "t"))
+load1 <- clusterEvalQ(cl, require(splines))
+load2 <- clusterEvalQ(cl, require(SAfda))
+```
+
+The idea is: on each node, fire off a large number of sequential jobs. This
+ensures the overhead time of calling/coming back from each node isn't
+proportionally silly - we were getting a 10x speedup even with it,
+but this should provide even more. We'll do blocks of 100 iterations
+on each node, for each iteration. 
+
+The return will be a list of lists, and we'll have to peel it back 
+ apart, but everything will be named, so it shouldn't be too bad.
+
+```{r}
+start_i <- seq(from = 1, to = nrow(Dens.clr), by = 100)
+last_i <- start_i[length(start_i)]
+start_i <- start_i[-length(start_i)]
+```
+
+Note that the final one is tricky, and will need some logic, because it's
+not a full 100 rows.
+
+```{r, eval = FALSE}
+system.time(
+res <- parLapply(cl = cl, X = start_i, fun = function(x, nrow = 100) {
+    # inside this node/code, x is the starting line of the matrix 
+    res <- vector("list", length = nrow)
+    for(loop in 1:nrow) {
+      res[[loop]] <- SAfda::smoothing_spline0(knots = knots, 
+                                      tp = tp, 
+                                      f = as.matrix((Dens.clr[x + loop - 1, ])), 
+                                      w = w, 
+                                      k = k, 
+                                      der = der, 
+                                      alpha = alpha, 
+                                      ch = ch)[c("J", "z")]
+    }
+    names(res) <- x:(x + loop - 1)
+    res
+}))
+```
+
+And now, deal with the last < 100 cases:
+```{r, eval = FALSE}
+last <- vector("list", length = nrow(Dens.clr) - last_i + 1)
+for(loop in 1:length(last)) {
+  last[[loop]] <- smoothing_spline0(knots = knots, 
+                                  tp = tp,
+                                  f = as.matrix((Dens.clr[last_i + loop - 1, ])), 
+                                  w = w, 
+                                  k = k, 
+                                  der = der, 
+                                  alpha = alpha, 
+                                  ch = ch)[c("J", "z")]
+}
+names(last) <- last_i:(last_i + loop - 1)
+res[[(length(res) + 1)]] <- last
+names(res) <- c(start_i, last_i)
+```
+
+Stop the cluster:
+```{r}
+stopCluster(cl)
+```
+
+And now we extract the objects. In this file, the above chunks were set to
+`eval = FALSE`, because they still take a number of hours (8 or so with 16
+cores). We instead save and load the object here, and then continue.
+
+```{r, eval = FALSE}
+save(file = "results.rda", res)
+```
+
+```{r}
+load(file = "results.rda")
+```
+
+Now, extract the objects from the `res` list. This list is 687
+elements long, and each element is a list of 100 (for all except
+the last) row-conversions. We want to extract the row-conversions:
+the `z_coef`s and the `J`s.
+
+```{r, extractJ}
+Js <- unlist(lapply(res, FUN = function(x) { 
+    lapply(x, "[[", 1)
+    }))
+Js <- as.numeric(Js)
+```
+
+```{r, extractZ}
+Zs <- do.call("rbind", lapply(res, FUN = function(x) {
+  y <- t(data.frame(lapply(x, "[[", 2)))
+  row.names(y) <- names(x)
+  y
+}))
+z_coef <- t(as.matrix(Zs))
+```
+
+### Define the Z spline basis
+
+```{r}
+AuxZB <- SAfda::z_spline_basis(knots = knots, k)
+Z <- AuxZB$C0
+b_coef <- t(AuxZB$D) %*% AuxZB$K %*% z_coef
+```
+
+### Create the Outputs
+
+We now rearrange these objects to create the required inputs for
+the analysis and plotting routines to follow.
+
+```{r}
+CLRData <- vector("list")
+CLRData$x.fine <- x.fine
+CLRData$x.step <- x.step
+CLRData$centers <- centers
+CLRData$densities <- densities
+CLRData$Dens.clr <- Dens.clr
+```
+
+and the basis info:
+```{r}
+Bsplinepar <- vector("list")
+Bsplinepar$knots <- knots
+Bsplinepar$w <- w
+Bsplinepar$k <- k
+Bsplinepar$der <- der
+Bsplinepar$alfa <- alpha
+Bsplinepar$ch <- ch     
+Bsplinepar$t <- tp
+```
+
+Finally, we save the output of this file:
+
+```{r}
+save(file = "./dat/data_coef_n20.rda", 
+     z_coef, Z, b_coef, Bsplinepar, CLRData)
+```
+
